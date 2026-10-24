@@ -1,6 +1,6 @@
 # Neovim setup: install guide for an agent
 
-This guide reproduces a beginner-friendly Neovim setup. It has fuzzy finding, LSP for C/C++ with clangd, autocomplete, Tree-sitter highlighting, auto-pairs, a status bar, bright relative line numbers, and Space-leader shortcuts.
+This guide reproduces a beginner-friendly Neovim setup. It has fuzzy finding, LSP for C/C++ with clangd, autocomplete, Tree-sitter highlighting, auto-pairs, a status bar, a VS Code-style file tree sidebar, a git changed-files picker that works across multi-repo folders (e.g. Brazil workspaces), a terminal launcher, bright relative line numbers, and Space-leader shortcuts.
 
 It was built and verified on **Amazon Linux 2 (x86_64, glibc 2.26)** with Neovim 0.12.5. Instructions for other OSes use each platform's standard install method but **haven't been tested**. Verify every step with the checks in section 5.
 
@@ -22,7 +22,7 @@ Versions used in the original build: Neovim 0.12.5, clangd 23.1.0 (via Mason), t
 | Tool | Minimum | Why |
 |---|---|---|
 | neovim | 0.12 | editor; `vim.pack` plugin manager |
-| git | any | `vim.pack` clones plugins |
+| git | any | `vim.pack` clones plugins; `Space c` and the file tree's git status call it |
 | curl, tar, unzip | any | Mason downloads and extracts language servers; nvim-treesitter downloads grammars |
 | C compiler (gcc/clang/cl/zig) | any | compiles Tree-sitter parsers |
 | make | any | builds telescope-fzf-native (optional; telescope works without it) |
@@ -145,6 +145,10 @@ vim.opt.smartcase = true
 -- Keep a few lines visible above/below the cursor when scrolling
 vim.opt.scrolloff = 8
 
+-- New splits open to the right / below (like VS Code) instead of left / above
+vim.opt.splitright = true
+vim.opt.splitbelow = true
+
 -- Always show the error/warning column so text doesn't jump sideways when one appears
 vim.opt.signcolumn = "yes"
 
@@ -178,6 +182,46 @@ vim.keymap.set("n", "<C-h>", "<C-w>h", { desc = "Window left" })
 vim.keymap.set("n", "<C-j>", "<C-w>j", { desc = "Window down" })
 vim.keymap.set("n", "<C-k>", "<C-w>k", { desc = "Window up" })
 vim.keymap.set("n", "<C-l>", "<C-w>l", { desc = "Window right" })
+
+-- Space T = open a terminal, then press one key for where it goes:
+--   l = right, j = below, h = left, k = above, t = new tab, Enter = in this window, Esc = cancel
+-- Inside the terminal, Ctrl-h/j/k/l jumps straight to another window, same as everywhere else.
+-- Esc twice stops typing into it without leaving (to scroll or copy its output).
+local terminal_places = {
+  l = "rightbelow vsplit",
+  j = "rightbelow split",
+  h = "leftabove vsplit",
+  k = "leftabove split",
+  t = "tabnew",
+  ["\r"] = "", -- Enter: no split
+}
+local function open_terminal()
+  vim.api.nvim_echo({ { "Terminal: l=right j=below h=left k=above t=tab Enter=here", "Question" } }, false, {})
+  local ok, key = pcall(vim.fn.getcharstr) -- wait for one key press
+  vim.api.nvim_echo({ { "" } }, false, {}) -- clear the prompt
+  local place = ok and terminal_places[key]
+  if not place then
+    return -- Esc or any other key cancels
+  end
+  if place ~= "" then
+    vim.cmd(place)
+  end
+  vim.cmd.terminal()
+  vim.cmd.startinsert() -- start typing into the shell right away
+end
+vim.keymap.set("n", "<leader>T", open_terminal, { desc = "Open terminal (asks where)" })
+vim.keymap.set("t", "<Esc><Esc>", [[<C-\><C-n>]], { desc = "Stop typing into terminal" })
+-- (This takes over the shell's own Ctrl-l "clear screen"; type `clear` instead.)
+for _, key in ipairs({ "h", "j", "k", "l" }) do
+  vim.keymap.set("t", "<C-" .. key .. ">", [[<C-\><C-n><C-w>]] .. key, { desc = "Window " .. key })
+end
+-- Moving into a terminal window puts you straight back into typing mode
+vim.api.nvim_create_autocmd("BufEnter", {
+  pattern = "term://*",
+  callback = function()
+    vim.cmd.startinsert()
+  end,
+})
 
 ----------------------------------------------------------------------------------------------
 -- Plugins (installed by Neovim's built-in plugin manager, vim.pack)
@@ -219,6 +263,8 @@ vim.pack.add({
   gh("hrsh7th/cmp-buffer"),
   gh("hrsh7th/cmp-path"),
   gh("windwp/nvim-autopairs"),
+  gh("MunifTanjim/nui.nvim"),
+  { src = gh("nvim-neo-tree/neo-tree.nvim"), version = vim.version.range("3") },
 }, { confirm = false })
 
 -- Status bar (the "NORMAL > file > ..." line at the bottom).
@@ -248,6 +294,101 @@ vim.keymap.set("n", "<leader>o", builtin.oldfiles, { desc = "Recently opened fil
 vim.keymap.set("n", "<leader>d", builtin.diagnostics, { desc = "List errors/warnings" })
 vim.keymap.set("n", "<leader>k", builtin.keymaps, { desc = "Search all shortcuts" })
 vim.keymap.set("n", "<leader>h", builtin.help_tags, { desc = "Search help" })
+-- Fuzzy-filter files changed in git (new/modified/deleted) with a diff preview.
+-- Inside one repo this is Telescope's git_status (Tab = stage/unstage). In a folder holding
+-- several repos (e.g. a Brazil workspace or its src/), it lists changes from all of them.
+-- Status codes are git's: " M" = modified, "??" = new (untracked), "A " = added, " D" = deleted.
+local function git_changed_files()
+  local cwd = vim.fn.getcwd()
+  -- Ask git rather than looking for a .git folder: tools can leave a stray, empty .git behind
+  if vim.system({ "git", "-C", cwd, "rev-parse", "--is-inside-work-tree" }):wait().code == 0 then
+    return builtin.git_status()
+  end
+
+  local repos = {}
+  for _, pattern in ipairs({ "*/.git", "*/*/.git" }) do
+    for _, git_dir in ipairs(vim.fn.globpath(cwd, pattern, false, true)) do
+      table.insert(repos, vim.fs.dirname(git_dir))
+    end
+  end
+  if #repos == 0 then
+    return vim.notify("No git repos in " .. cwd, vim.log.levels.WARN)
+  end
+  table.sort(repos)
+
+  -- Run git status in every repo at once, then collect the results
+  local jobs = {}
+  for i, repo in ipairs(repos) do
+    jobs[i] = vim.system({ "git", "-C", repo, "status", "--porcelain", "-z", "-uall" })
+  end
+  local changes = {}
+  for i, repo in ipairs(repos) do
+    local fields = vim.split(jobs[i]:wait().stdout or "", "\0", { trimempty = true })
+    local skip_next = false
+    for _, field in ipairs(fields) do
+      if skip_next then
+        skip_next = false -- old name of a renamed/copied file
+      else
+        local status, file = field:sub(1, 2), field:sub(4)
+        skip_next = status:find("[RC]") ~= nil
+        table.insert(changes, { status = status, repo = repo, file = file, path = repo .. "/" .. file })
+      end
+    end
+  end
+  if #changes == 0 then
+    return vim.notify("No changes in " .. #repos .. " repos", vim.log.levels.INFO)
+  end
+
+  local conf = require("telescope.config").values
+  require("telescope.pickers").new({}, {
+    prompt_title = "Git changed files (" .. #repos .. " repos)",
+    finder = require("telescope.finders").new_table({
+      results = changes,
+      entry_maker = function(change)
+        local display = change.status .. " " .. change.path:sub(#cwd + 2)
+        return { value = change, display = display, ordinal = display, path = change.path }
+      end,
+    }),
+    sorter = conf.file_sorter({}),
+    previewer = require("telescope.previewers").new_buffer_previewer({
+      title = "Git File Diff Preview",
+      define_preview = function(self, entry)
+        local change = entry.value
+        if change.status == "??" or change.status == "A " then -- new file: show its contents
+          conf.buffer_previewer_maker(change.path, self.state.bufnr, { bufname = self.state.bufname })
+        else
+          local diff = vim.system({ "git", "-C", change.repo, "--no-pager", "diff", "HEAD", "--", change.file }):wait()
+          vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, vim.split(diff.stdout or "", "\n"))
+          require("telescope.previewers.utils").highlighter(self.state.bufnr, "diff")
+        end
+      end,
+    }),
+  }):find()
+end
+vim.keymap.set("n", "<leader>c", git_changed_files, { desc = "Git changed files" })
+
+-- File tree sidebar, like VS Code's Explorer. Space t = show/hide.
+-- Inside the tree: Enter = open, a = new file (end name with / for a folder), d = delete,
+-- r = rename, H = show hidden files, / = filter by name, ? = list all tree keys,
+-- < and > = switch view between Files / Open buffers / Git (only changed files).
+-- Changed files are colored and tagged: M = modified, ? = new (untracked), A = added, D = deleted.
+require("neo-tree").setup({
+  close_if_last_window = true, -- quit Neovim instead of leaving just the tree open
+  filesystem = {
+    follow_current_file = { enabled = true }, -- highlight the file you're editing
+    use_libuv_file_watcher = true, -- refresh when files change on disk
+  },
+  default_component_configs = nerd_font and {} or {
+    icon = { folder_closed = "▸", folder_open = "▾", folder_empty = "▹", folder_empty_open = "▿" },
+    git_status = {
+      symbols = {
+        added = "A", modified = "M", deleted = "D", renamed = "R", untracked = "?",
+        ignored = "i", conflict = "!", unstaged = "", staged = "S",
+      },
+    },
+  },
+})
+vim.keymap.set("n", "<leader>t", "<cmd>Neotree toggle<CR>", { desc = "Toggle file tree" })
 
 -- Treesitter: accurate syntax highlighting. Parsers are compiled by the tree-sitter CLI.
 if vim.fn.executable("tree-sitter") == 1 then
@@ -340,6 +481,15 @@ vim.api.nvim_create_autocmd("LspAttach", {
       "rev": "2a6940af80375532e5e9e7c1f2fc6319a1b7a69d",
       "src": "https://github.com/mason-org/mason.nvim"
     },
+    "neo-tree.nvim": {
+      "rev": "f3f3bf73414e400cf9fc13fda50f00404a8f8ab1",
+      "src": "https://github.com/nvim-neo-tree/neo-tree.nvim",
+      "version": "3.0.0 - 4.0.0"
+    },
+    "nui.nvim": {
+      "rev": "10fc361835c856ba4233ef5ea135b919bf3dce97",
+      "src": "https://github.com/MunifTanjim/nui.nvim"
+    },
     "nvim-autopairs": {
       "rev": "3172f40c16563db871a58f20d205c710ad782311",
       "src": "https://github.com/windwp/nvim-autopairs"
@@ -416,6 +566,7 @@ table.insert(out, "fzf ext: " .. tostring(pcall(function() return require("teles
 for _, d in ipairs(vim.diagnostic.get(0)) do table.insert(out, "diag L" .. (d.lnum + 1) .. ": " .. d.message) end
 local ok = pcall(require("telescope.builtin").find_files)
 table.insert(out, "telescope find_files: " .. tostring(ok))
+table.insert(out, "neo-tree: " .. tostring(vim.fn.exists(":Neotree") == 2))
 local msgs = vim.api.nvim_exec2("messages", { output = true }).output
 table.insert(out, "startup messages: " .. (msgs == "" and "(none)" or msgs))
 io.write(table.concat(out, "\n") .. "\n")
@@ -428,6 +579,7 @@ treesitter active: true
 fzf ext: true
 diag L6: Use of undeclared identifier 'undefined_var'
 telescope find_files: true
+neo-tree: true
 startup messages: (none)
 ```
 `fzf ext: false` is acceptable when `make` is missing; telescope falls back to its default sorter.
@@ -449,6 +601,8 @@ startup messages: (none)
 | nvim-cmp | hrsh7th/nvim-cmp | autocomplete popup |
 | cmp-nvim-lsp / cmp-buffer / cmp-path | hrsh7th/* | completion sources: LSP, words in the buffer, file paths |
 | nvim-autopairs | windwp/nvim-autopairs | auto-closes brackets and quotes; adds `()` after accepting a function |
+| nui.nvim | MunifTanjim/nui.nvim | UI component library that neo-tree needs |
+| neo-tree.nvim (v3.x) | nvim-neo-tree/neo-tree.nvim | file tree sidebar with git status markers; pinned to `vim.version.range("3")` |
 
 Language server: **clangd** (C/C++), started with `--background-index --header-insertion=never`. To add Python, run `:Mason`, find `pyright`, and press `i` to install. mason-lspconfig enables it automatically.
 
@@ -463,16 +617,21 @@ Leader is **Space**.
 | `Space f` / `Space g` / `Space *` | find file / grep all files / grep word under cursor |
 | `Space /` / `Space b` / `Space o` | search this file / open buffers / recent files |
 | `Space d` / `Space k` / `Space h` | list diagnostics / search keymaps / search help |
+| `Space c` | git changed files with diff preview (current repo, or every repo one or two levels down) |
+| `Space t` | show / hide the file tree |
+| In the tree: `Enter` / `a` / `d` / `r` | open / new file (end with `/` for a folder) / delete / rename |
+| In the tree: `H` / `/` / `?` / `<` `>` | toggle hidden files / filter / list tree keys / switch Files, Buffers, Git views |
 | `Space w` / `Space q` | save / close window |
-| `Space v` / `Space s` | vertical / horizontal split |
-| `Ctrl-h/j/k/l` | move between splits |
+| `Space v` / `Space s` | vertical / horizontal split (new splits open right / below) |
+| `Ctrl-h/j/k/l` | move between splits (also works from inside a terminal) |
+| `Space T`, then `l` / `j` / `h` / `k` / `t` / `Enter` | open a terminal right / below / left / above / new tab / in this window (`Esc` cancels) |
+| `Esc Esc` (in terminal) | stop typing into the terminal (to scroll or copy); entering a terminal window resumes typing |
 | `Esc` (normal mode) | clear search highlight |
 | `gd` / `Ctrl-o` | go to definition / jump back |
 | `grr` / `grn` / `gra` / `gri` | references / rename / code action / implementation (Neovim built-ins) |
 | `K` | hover docs |
 | `]d` / `[d` / `Space e` | next / previous diagnostic / show the full diagnostic |
 | Completion: `Tab` / `Shift-Tab` / `Enter` / `Ctrl-Space` / `Ctrl-e` | next / previous / accept / open / close |
-| `:vsplit \| terminal` (`:leftabove vsplit \| terminal` for the left side) | terminal split; `Ctrl-\ Ctrl-n` leaves terminal input mode |
 
 ---
 
@@ -483,7 +642,9 @@ Leader is **Space**.
 - **tree-sitter CLI from npm**: nvim-treesitter explicitly says not to use it. Use the system package, the official binary, or cargo.
 - **Missing parsers**: if `tree-sitter` isn't on `PATH` at startup, the config skips parser installs and highlighting falls back to regex syntax. Install the CLI, then rerun step 2 of section 4.
 - **Inline errors**: Neovim ≥ 0.11 turns diagnostic virtual text off by default. This config turns it back on.
-- **Nerd Font**: the status bar uses plain separators by default. Set `local nerd_font = true` in `init.lua` once the terminal uses a Nerd Font, to get arrow separators and icons.
+- **Nerd Font**: the status bar and file tree use plain separators, `▸`/`▾` folder markers, and letter git markers (`M`, `?`, `A`, `D`) by default. Set `local nerd_font = true` in `init.lua` once the terminal uses a Nerd Font, to get arrow separators and icons in both.
+- **Terminal `Ctrl-l`**: the terminal-mode `Ctrl-h/j/k/l` window mappings take over the shell's own `Ctrl-l` (clear screen). Type `clear` instead.
+- **`Space c` outside a repo**: when the current directory isn't inside a git work tree, it scans `*/.git` and `*/*/.git` under it (e.g. a Brazil workspace root or its `src/`). Repos nested deeper aren't found; `cd` closer to them first.
 - **clangd in real projects**: clangd needs `compile_commands.json` (or a `.clangd` file) at the project root. Without it, you'll see "file not found" errors for project headers and limited cross-file navigation.
 - **Updating plugins**: run `:lua vim.pack.update()`, review the confirmation buffer, then `:w` to apply. Run `:TSUpdate` for parsers (the config's hook does this after nvim-treesitter updates), and `:Mason` then `U` for servers.
 - **Uninstall**: remove the Neovim install directory (e.g. `~/.local/opt/nvim-linux-x86_64` plus the `~/.local/bin/nvim` symlink), `<config>`, and the data dir (`~/.local/share/nvim`).
